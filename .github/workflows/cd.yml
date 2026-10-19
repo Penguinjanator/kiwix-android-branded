@@ -1,15 +1,86 @@
 name: CD
 
+# Publication tags follow the convention:
+#   <app>.<date>            first publication of a given ZIM
+#   <app>.<date>.<nn>       republish of the same ZIM (nn = 1, 2, ...)
+# where
+# - <app> is the branded app folder name
+# - <date> is the date suffix of the ZIM filename: YYYY-MM, optionally followed by
+#     one or two lowercase letters when a title flavour is updated several times in the
+#     same month (e.g. 2026-05, 2026-02a, 2026-05bc).
+# - The optional <nn> keeps every publication attempt unambiguous, so a failed build
+#     can simply be retried with the next number.
+#
+# Legacy/manual releases still use the bare app folder name as the tag and
+# remain supported.
+
 on:
   release:
     types: [published]
-    branches:
-      - main
 
 jobs:
-  publish:
+  prepare:
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      app: ${{ steps.app.outputs.app }}
+      is_new: ${{ steps.config.outputs.is_new }}
+      upload_bundle: ${{ steps.config.outputs.upload_bundle }}
+      revision: ${{ steps.config.outputs.revision }}
+    steps:
+      - name: Retrieving branded app configuration
+        uses: actions/checkout@v4
 
+      - name: Resolve app identifier from release tag
+        id: app
+        run: |
+          tag_name="${GITHUB_REF_NAME}"
+          if [[ "$tag_name" =~ ^([a-z0-9_-]+)\.[0-9]{4}-[0-9]{2}[a-z]{0,2}(\.[0-9]+)?$ ]]; then
+            app="${BASH_REMATCH[1]}"
+          else
+            # Legacy/manual releases use the app folder name as the tag.
+            app="$tag_name"
+          fi
+          if [[ ! "$app" =~ ^[a-z0-9_-]+$ ]] || [ ! -d "$app" ]; then
+            echo "error:: Invalid app identifier '$app' (release tag: '$tag_name')"
+            exit 1
+          fi
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Read app configuration
+        id: config
+        env:
+          APP: ${{ steps.app.outputs.app }}
+        run: |
+          info="${APP}/info.json"
+          if [ "$(jq -r '.deprecated // false' "$info")" = "true" ]; then
+            echo "error:: This app is marked as deprecated in info.json. Publishing is not allowed."
+            exit 1
+          fi
+          revision=$(jq -r '."kiwix-android_revision" // empty' "$info")
+          if [ "$revision" = "latest" ]; then
+            revision=""
+          fi
+          echo "is_new=$(jq -r '.new // false' "$info")" >> "$GITHUB_OUTPUT"
+          echo "upload_bundle=$(jq -r '.upload_bundle // false' "$info")" >> "$GITHUB_OUTPUT"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+  # Normal publication: an app already registered and manually bootstrapped on
+  # Google Play. Runs only when the app is not a first release.
+  publish:
+    needs: prepare
+    if: needs.prepare.outputs.is_new != 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.prepare.outputs.app }}
+      REV_ID: ${{ needs.prepare.outputs.revision }}
+      SHOULD_PUBLISH_BUNDLE: ${{ needs.prepare.outputs.upload_bundle }}
     steps:
       - name: Retrieving branded app configuration
         uses: actions/checkout@v4
@@ -20,33 +91,15 @@ jobs:
           java-version: 21
           distribution: temurin
 
-      - name: Set tag variable
-        run: echo "TAG=$(echo ${GITHUB_REF:10})" >> $GITHUB_ENV
-
-      - name: Install jq
-        run: sudo apt-get install -y jq
-
-      - name: Read revision ID from info.json
-        run: |
-          cd ${TAG}
-          rev_id=$(jq -r '."kiwix-android_revision" // empty' info.json)
-          if [ -z "$rev_id" ] || [ "$rev_id" = "latest" ]; then
-            echo "REV_ID=" >> $GITHUB_ENV
-          else
-            echo "REV_ID=$rev_id" >> $GITHUB_ENV
-          fi
-
       - name: Retrieving Kiwix Android source code
         run: |
-          if [ -z "${{ env.REV_ID }}" ]; then
+          if [ -z "$REV_ID" ]; then
             echo "Cloning latest commit from main branch"
             git clone --depth=1 --single-branch --branch main https://github.com/kiwix/kiwix-android.git
           else
-            echo "Cloning specific commit: ${{ env.REV_ID }}"
+            echo "Cloning specific commit: $REV_ID"
             git clone https://github.com/kiwix/kiwix-android.git
-            cd kiwix-android
-            git checkout ${{ env.REV_ID }}
-            cd ..
+            git -C kiwix-android checkout "$REV_ID"
           fi
 
       - name: Copying branded app configuration into Kiwix Android code base
@@ -70,28 +123,6 @@ jobs:
             echo "$playstore_json" > kiwix-android/playstore.json
           fi
 
-      - name: Check app is not deprecated
-        run: |
-          cd ${TAG}
-          is_deprecated=$(jq -r '.deprecated // empty' info.json)
-          if [ "$is_deprecated" = "true" ]; then
-            echo "Error: This app is marked as deprecated in info.json. Publishing is not allowed."
-            exit 1
-          else
-            echo "App is not deprecated. Continuing…"
-          fi
-
-      - name: Should upload Bundle
-        run: |
-          cd ${TAG}
-          should_publish_bundle=$(jq -r '.upload_bundle // empty' info.json)
-          if [ "$should_publish_bundle" == 'true' ]; then
-            echo "should_publish_bundle=true" >> $GITHUB_ENV
-          else
-            echo "APK_BUILD=true" >> $GITHUB_ENV
-            echo "should_publish_bundle=false" >> $GITHUB_ENV
-          fi
-
       - name: Publishing app to Google Play
         env:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
@@ -100,15 +131,22 @@ jobs:
           DWDS_HTTP_BASIC_ACCESS_AUTHENTICATION: ${{ secrets.DWDS_HTTP_BASIC_ACCESS_AUTHENTICATION }}
         run: |
           cd kiwix-android
-          if [ "${{ env.should_publish_bundle }}" == 'true' ]; then
-            eval "./gradlew publish${TAG^}ReleaseBundleWithPlayAssetDelivery"
+          if [ "$SHOULD_PUBLISH_BUNDLE" = "true" ]; then
+            ./gradlew "publish${TAG^}ReleaseBundleWithPlayAssetDelivery"
           else
-            eval "./gradlew publish${TAG^}ReleaseApkWithExpansionFile"
+            ./gradlew "publish${TAG^}ReleaseApkWithExpansionFile"
           fi
 
+  # First release: produce the dummy bundle to upload manually to Google Play.
   publish_dummy_bundle:
+    needs: prepare
+    if: needs.prepare.outputs.is_new == 'true'
     runs-on: ubuntu-22.04
-
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.prepare.outputs.app }}
+      REV_ID: ${{ needs.prepare.outputs.revision }}
     steps:
       - name: Retrieving branded app configuration
         uses: actions/checkout@v4
@@ -119,68 +157,27 @@ jobs:
           java-version: 21
           distribution: temurin
 
-      - name: Set tag variable
-        run: echo "TAG=$(echo ${GITHUB_REF:10})" >> $GITHUB_ENV
-
-      - name: Install jq
-        run: sudo apt-get install -y jq
-
-      - name: Read revision ID from info.json
-        run: |
-          cd ${TAG}
-          rev_id=$(jq -r '."kiwix-android_revision" // empty' info.json)
-          if [ -z "$rev_id" ] || [ "$rev_id" = "latest" ]; then
-            echo "REV_ID=" >> $GITHUB_ENV
-          else
-            echo "REV_ID=$rev_id" >> $GITHUB_ENV
-          fi
-
       - name: Retrieving Kiwix Android source code
         run: |
-          if [ -z "${{ env.REV_ID }}" ]; then
+          if [ -z "$REV_ID" ]; then
             echo "Cloning latest commit from main branch"
             git clone --depth=1 --single-branch --branch main https://github.com/kiwix/kiwix-android.git
           else
-            echo "Cloning specific commit: ${{ env.REV_ID }}"
+            echo "Cloning specific commit: $REV_ID"
             git clone https://github.com/kiwix/kiwix-android.git
-            cd kiwix-android
-            git checkout ${{ env.REV_ID }}
-            cd ..
+            git -C kiwix-android checkout "$REV_ID"
           fi
 
       - name: Copying branded app configuration into Kiwix Android code base
         run: ./copy_files_to_kiwix_android.sh
 
-      - name: Check app is not deprecated
-        run: |
-          cd ${TAG}
-          is_deprecated=$(jq -r '.deprecated // empty' info.json)
-          if [ "$is_deprecated" = "true" ]; then
-            echo "Error: This app is marked as deprecated in info.json. Publishing is not allowed."
-            exit 1
-          else
-            echo "App is not deprecated. Continuing…"
-          fi
-
-      - name: Should upload dummy Bundle
-        run: |
-          cd ${TAG}
-          should_publish=$(jq -r '.new // empty' info.json)
-          if [ "$should_publish" == 'true' ]; then
-            echo "should_publish=true" >> $GITHUB_ENV
-          else
-            echo "should_publish=false" >> $GITHUB_ENV
-          fi
-
       - name: Preparing signing material
-        if: env.should_publish == 'true'
         env:
           keystore: ${{ secrets.keystore }}
         run: |
           echo "$keystore" | base64 -d > kiwix-android/kiwix-android.keystore
 
       - name: Generate dummy Bundle
-        if: env.should_publish == 'true'
         env:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
@@ -188,11 +185,9 @@ jobs:
           DWDS_HTTP_BASIC_ACCESS_AUTHENTICATION: ${{ secrets.DWDS_HTTP_BASIC_ACCESS_AUTHENTICATION }}
         run: |
           cd kiwix-android
-          eval "./gradlew bundle${TAG^}Release"
-
+          ./gradlew "bundle${TAG^}Release"
 
       - name: Get Bundle name and path
-        if: env.should_publish == 'true'
         id: bundle-path
         run: |
           BUNDLE_PATH="kiwix-android/branded/build/outputs/bundle/${TAG}Release/*${TAG}*.aab"
@@ -201,9 +196,31 @@ jobs:
           echo "bundle_name=$BUNDLE_NAME" >> $GITHUB_ENV
 
       - name: Upload Bundle as an artifact
-        if: env.should_publish == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.bundle_name }}
           path: ${{ env.bundle_path }}
 
+  # Annotate the release when a publication actually failed.
+  report_failure:
+    needs: [prepare, publish, publish_dummy_bundle]
+    if: >
+      always() && (
+        needs.prepare.result == 'failure' ||
+        needs.publish.result == 'failure' ||
+        needs.publish_dummy_bundle.result == 'failure'
+      )
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Mark release as failed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag_name="${GITHUB_REF_NAME}"
+          body="$(gh release view "$tag_name" --json body -q .body 2>/dev/null || true)"
+          gh release edit "$tag_name" --notes "${body}
+
+          > [!WARNING]
+          > Build failed. See [run ${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
