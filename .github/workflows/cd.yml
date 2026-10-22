@@ -85,6 +85,7 @@ jobs:
       TAG: ${{ needs.prepare.outputs.app }}
       REV_ID: ${{ needs.prepare.outputs.revision }}
       SHOULD_PUBLISH_BUNDLE: ${{ needs.prepare.outputs.upload_bundle }}
+      APK_BUILD: ${{ needs.prepare.outputs.upload_bundle != 'true' && 'true' || '' }}
     steps:
       - name: Retrieving branded app configuration
         uses: actions/checkout@v4
