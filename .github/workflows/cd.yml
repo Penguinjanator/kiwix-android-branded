@@ -42,8 +42,12 @@ jobs:
             # Legacy/manual releases use the app folder name as the tag.
             app="$tag_name"
           fi
-          if [[ ! "$app" =~ ^[a-z0-9_-]+$ ]] || [ ! -d "$app" ]; then
-            echo "error:: Invalid app identifier '$app' (release tag: '$tag_name')"
+          if [[ ! "$app" =~ ^[a-z0-9_-]+$ ]]; then
+            echo "::error::Invalid app identifier '$app' (release tag: '$tag_name')"
+            exit 1
+          fi
+          if [ ! -d "$app" ]; then
+            echo "::error::No branded app directory '$app' at release tag '$tag_name'"
             exit 1
           fi
           echo "app=$app" >> "$GITHUB_OUTPUT"
@@ -58,7 +62,7 @@ jobs:
         run: |
           info="${APP}/info.json"
           if [ "$(jq -r '.deprecated // false' "$info")" = "true" ]; then
-            echo "error:: This app is marked as deprecated in info.json. Publishing is not allowed."
+            echo "::error::This app is marked as deprecated in info.json. Publishing is not allowed."
             exit 1
           fi
           revision=$(jq -r '."kiwix-android_revision" // empty' "$info")
@@ -217,6 +221,7 @@ jobs:
       - name: Mark release as failed
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           tag_name="${GITHUB_REF_NAME}"
           body="$(gh release view "$tag_name" --json body -q .body 2>/dev/null || true)"
